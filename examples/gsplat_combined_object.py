@@ -25,6 +25,7 @@ class GsplatCombinedObject:
         self.origin = torch.tensor([0.0, 0.0, 0.0], device=self.scene.splats["means"].device, dtype=torch.float64)
         self.xyzw = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
         self.xyzw_origin = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
+        self.scale = torch.tensor([1.0, 1.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
 
         self._add_to_scene()
 
@@ -78,3 +79,17 @@ class GsplatCombinedObject:
         todo_position_offset_adjust = todo_position_origin_adjust - offset_adjust.squeeze(0) + self.position.unsqueeze(0)
         
         self.scene.transform(self.name, trans=todo_position_offset_adjust, quart=todo_xyzw.squeeze(0))
+
+    def adjust_scale(self, scale: list[float]):
+        """
+        Adjust the scale of the object in the scene.
+        """
+        old_scale = self.scale
+        cursor_position = self.position + self.origin
+        scale_t = torch.tensor(scale, device=self.scene.splats["means"].device, dtype=torch.float64)
+        self.scale = scale_t
+        todo_scale = scale_t / old_scale
+        position_adjust = cursor_position * (1-todo_scale)
+        self.origin = self.origin * todo_scale
+        self.position = cursor_position - self.origin
+        self.scene.transform(self.name, scale=todo_scale, trans=position_adjust)

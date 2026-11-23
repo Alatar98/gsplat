@@ -52,15 +52,6 @@ class GsplatCombinedObject_viser(GsplatCombinedObject):
         super().__init__(name, ply_file, parent.scene)
 
         self.parent.rerender(None)
-
-
-    def move_to(self, position: list[float], wxyz: list[float]):
-        """
-        Move the object in the scene. Then rerender the scene.
-        """
-        super().move_to(position, wxyz)
-
-        self.parent.rerender(None)
         
 
     def populate_gui(self, server: viser.ViserServer, folder_handle: viser.GuiFolderHandle):
@@ -115,6 +106,7 @@ class GsplatCombinedObject_viser(GsplatCombinedObject):
             def _(_) -> None:
                 if move_button.value:
                     self.move_to(mover.position, mover.wxyz)
+                    self.parent.rerender(None)
                 else:
                     self.origin = torch.tensor(mover.position, device=self.scene.splats["means"].device,dtype=torch.float64) - self.position
                     mover_xyzw = torch.tensor([mover.wxyz[1], mover.wxyz[2], mover.wxyz[3], mover.wxyz[0]], device=self.scene.splats["means"].device,dtype=torch.float64)  # convert xyzw to wxyz
@@ -126,6 +118,18 @@ class GsplatCombinedObject_viser(GsplatCombinedObject):
 
 
             #scale
+            scale_slider = server.gui.add_number(
+                "Scale",
+                initial_value=1.0,
+                min=0.01,
+                max=10.0,
+                step=0.01,
+                hint=f"Scale of the object {self.name}.",
+            )
+            @scale_slider.on_update
+            def _(_) -> None:
+                self.adjust_scale([scale_slider.value, scale_slider.value, scale_slider.value])
+                self.parent.rerender(None)
 
             add_keyframe_button = server.gui.add_button(
                 "Add Keyframe",

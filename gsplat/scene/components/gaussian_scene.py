@@ -181,9 +181,7 @@ class GaussianScene(Scene):
         if not torch.equal(scale, torch.tensor([1.0, 1.0, 1.0],device=self.splats["means"].device)):
             scale = scale.to(dtype=self.splats["means"].dtype)
             self.splats["means"][mask] = self.splats["means"][mask] * scale
-            #TODO check if log space
-            scale = scale.to(dtype=self.splats["scales"].dtype)
-            self.splats["scales"][mask] = self.splats["scales"][mask] * scale
+            self.splats["scales"][mask] = self.splats["scales"][mask] + scale.log()
         if not torch.equal(quart, torch.tensor([0.0, 0.0, 0.0, 1.0],device=self.splats["means"].device)):
             quart = quart.to(dtype=self.splats["quats"].dtype)
             quart_same_dim = quart.reshape(1, 4).expand(int(mask.sum()), -1)
