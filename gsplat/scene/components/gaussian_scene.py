@@ -19,6 +19,7 @@ import torch
 
 from .base import Scene
 
+from ...geometry.functional import quaternion as quat
 
 class GaussianScene(Scene):
     """Wrapper around Gaussian splat parameters and extra signal data."""
@@ -161,6 +162,59 @@ class GaussianScene(Scene):
             "splats": {key: value[mask] for key, value in self.splats.items()},
             "signal": {key: value[mask] for key, value in self.signal.items()},
         }
+
+    @ torch.no_grad()
+    def transform(self, component: str | int, trans: torch.Tensor = torch.zeros(3), quart: torch.Tensor = torch.tensor([0.0, 0.0, 0.0, 1.0]), scale: torch.Tensor = torch.ones(3)) -> None:
+        """Apply a rigid transform to the splats of a component.
+
+        Args:
+            component: name or index of the component to transform
+            trans: translation vector of shape [3]
+            quart: quaternion of shape [4] representing rotation xyzw
+            scale: scale vector of shape [3]
+        """
+        component_id = self._component_id(component)
+        mask = self.component_index == component_id
+        scale = scale.to(device=self.splats["means"].device)
+        quart = quart.to(device=self.splats["means"].device)
+        trans = trans.to(device=self.splats["means"].device)
+        if not torch.equal(scale, torch.tensor([1.0, 1.0, 1.0],device=self.splats["means"].device)):
+            scale = scale.to(dtype=self.splats["means"].dtype)
+            self.splats["means"][mask] = self.splats["means"][mask] * scale
+            #TODO check if log space
+            scale = scale.to(dtype=self.splats["scales"].dtype)
+            self.splats["scales"][mask] = self.splats["scales"][mask] * scale
+        if not torch.equal(quart, torch.tensor([0.0, 0.0, 0.0, 1.0],device=self.splats["means"].device)):
+            quart = quart.to(dtype=self.splats["quats"].dtype)
+            quart_same_dim = quart.reshape(1, 4).expand(int(mask.sum()), -1)
+            quats_splats = self.splats["quats"][mask]
+            quats_splats = quats_splats[:, [1,2,3,0]]  # xyzw to wxyz
+            quats_splats_new = quat.quat_multiply(quart_same_dim, quats_splats)
+            quats_splats_new = quats_splats_new[:, [3,0,1,2]]  # wxyz to xyzw
+            self.splats["quats"][mask] = quats_splats_new
+            self.splats["means"][mask] = quat.quat_rotate_vector(quart_same_dim, self.splats["means"][mask])
+            #TODO: adjust view dependent colours
+        if not torch.equal(trans, torch.zeros(3, device=self.splats["means"].device)):
+            trans = trans.to(dtype=self.splats["means"].dtype)
+            self.splats["means"][mask] = self.splats["means"][mask] + trans
+            
+        
+
+
+
+    def remove_component(self, component: str | int) -> None:
+        """Remove a component and its associated splats and signal data."""
+        component_id = self._component_id(component)
+        mask = self.component_index != component_id
+        self.splats = torch.nn.ParameterDict(
+            {key: value[mask] for key, value in self.splats.items()}
+        )
+        self.signal = {key: value[mask] for key, value in self.signal.items()}
+        self.component_index = self.component_index[mask]
+        self.component_index = torch.where(self.component_index > component_id, self.component_index - 1, self.component_index)
+        del self.component_names[component_id]
+        
+
 
     def state_dict(self) -> dict[str, object]:
         return {

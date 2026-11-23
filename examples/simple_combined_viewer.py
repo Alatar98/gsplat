@@ -72,125 +72,11 @@ def main(local_rank: int, world_rank, world_size: int, args):
             }
         )
         gaussian_scene = GaussianScene.from_splats(splats, id="viewer_scene")
-    elif args.ckpt is None:
-        (
-            means,
-            quats,
-            scales,
-            opacities,
-            colors,
-            viewmats,
-            Ks,
-            width,
-            height,
-        ) = load_test_data(device=device, scene_grid=args.scene_grid)
 
-        assert world_size <= 2
-        means = means[world_rank::world_size].contiguous()
-        quats = quats[world_rank::world_size].contiguous()
-        scales = scales[world_rank::world_size].contiguous()
-        opacities = opacities[world_rank::world_size].contiguous()
-        colors = colors[world_rank::world_size].contiguous()
-
-        viewmats = viewmats[world_rank::world_size][:1].contiguous()
-        Ks = Ks[world_rank::world_size][:1].contiguous()
-
-        sh_degree = None
-        C = len(viewmats)
-        N = len(means)
-        print("rank", world_rank, "Number of Gaussians:", N, "Number of Cameras:", C)
-
-        # batched render (skipped for inference render: no backward, no RGB+D)
-        for _ in tqdm.trange(0 if args.use_gaussian_render_inference_scene else 1):
-            render_colors, render_alphas, meta = rasterization(
-                means,  # [N, 3]
-                quats,  # [N, 4]
-                scales,  # [N, 3]
-                opacities,  # [N]
-                colors,  # [N, S, 3]
-                viewmats,  # [C, 4, 4]
-                Ks,  # [C, 3, 3]
-                width,
-                height,
-                render_mode="RGB+D",
-                packed=False,
-                distributed=world_size > 1,
-            )
-        if not args.use_gaussian_render_inference_scene:
-            C = render_colors.shape[0]
-            assert render_colors.shape == (C, height, width, 4)
-            assert render_alphas.shape == (C, height, width, 1)
-
-            render_rgbs = render_colors[..., 0:3]
-            render_depths = render_colors[..., 3:4]
-            render_depths = render_depths / render_depths.max()
-
-            # dump batch images
-            os.makedirs(args.output_dir, exist_ok=True)
-            canvas = (
-                torch.cat(
-                    [
-                        render_rgbs.reshape(C * height, width, 3),
-                        render_depths.reshape(C * height, width, 1).expand(-1, -1, 3),
-                        render_alphas.reshape(C * height, width, 1).expand(-1, -1, 3),
-                    ],
-                    dim=1,
-                )
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            imageio.imsave(
-                f"{args.output_dir}/render_rank{world_rank}.png",
-                (canvas * 255).astype(np.uint8),
-            )
-
-        # Build GaussianScene for viewer callback (needs raw/log-space tensors)
-        splats = torch.nn.ParameterDict(
-            {
-                "means": torch.nn.Parameter(means.detach(), requires_grad=False),
-                "quats": torch.nn.Parameter(quats.detach(), requires_grad=False),
-                "scales": torch.nn.Parameter(
-                    scales.detach().log(), requires_grad=False
-                ),
-                "opacities": torch.nn.Parameter(
-                    torch.logit(opacities.detach().clamp(1e-6, 1 - 1e-6)),
-                    requires_grad=False,
-                ),
-                "colors": torch.nn.Parameter(colors.detach(), requires_grad=False),
-            }
-        )
-        gaussian_scene = GaussianScene.from_splats(splats, id="viewer_scene")
     else:
-        means, quats_list, scales_raw, opacities_raw, sh0, shN = [], [], [], [], [], []
-        for ckpt_path in args.ckpt:
-            ckpt = torch.load(ckpt_path, map_location=device)["splats"]
-            means.append(ckpt["means"])
-            quats_list.append(F.normalize(ckpt["quats"], p=2, dim=-1))
-            scales_raw.append(ckpt["scales"])  # raw log-space
-            opacities_raw.append(ckpt["opacities"])  # raw logit-space
-            sh0.append(ckpt["sh0"])
-            shN.append(ckpt["shN"])
-        means = torch.cat(means, dim=0)
-        quats = torch.cat(quats_list, dim=0)
-        scales_raw = torch.cat(scales_raw, dim=0)
-        opacities_raw = torch.cat(opacities_raw, dim=0)
-        sh0 = torch.cat(sh0, dim=0)
-        shN = torch.cat(shN, dim=0)
-        colors = torch.cat([sh0, shN], dim=-2)
-        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
-        print("Number of Gaussians:", len(means))
+        # Load checkpoint and build GaussianScene
+        assert "Must provide a PLY file"
 
-        splats = torch.nn.ParameterDict(
-            {
-                "means": torch.nn.Parameter(means, requires_grad=False),
-                "quats": torch.nn.Parameter(quats, requires_grad=False),
-                "scales": torch.nn.Parameter(scales_raw, requires_grad=False),
-                "opacities": torch.nn.Parameter(opacities_raw, requires_grad=False),
-                "colors": torch.nn.Parameter(colors, requires_grad=False),
-            }
-        )
-        gaussian_scene = GaussianScene.from_splats(splats, id="viewer_scene")
 
     # Build Inference scene if requested (after both loading paths)
     inference_scene = None
@@ -326,7 +212,9 @@ def main(local_rank: int, world_rank, world_size: int, args):
         server=server,
         render_fn=viewer_render_fn,
         output_dir=Path(args.output_dir),
+        scene=gaussian_scene,
         mode="rendering",
+        
     )
     if args.use_gaussian_render_inference_scene:
         viewer_kwargs["render_modes"] = ("rgb",)
@@ -351,12 +239,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", type=str, default="results/", help="where to dump outputs"
     )
-    parser.add_argument(
-        "--scene_grid", type=int, default=1, help="repeat the scene into a grid of NxN"
-    )
-    parser.add_argument(
-        "--ckpt", type=str, nargs="+", default=None, help="path to the .pt file"
-    )
     parser.add_argument("--ply", type=str, default=None, help="path to a 3DGS PLY file")
     parser.add_argument(
         "--port", type=int, default=8080, help="port for the viewer server"
@@ -371,6 +253,5 @@ if __name__ == "__main__":
         help="use the Inference (non-differentiable) rasterization path",
     )
     args = parser.parse_args()
-    assert args.scene_grid % 2 == 1, "scene_grid must be odd"
 
     cli(main, args, verbose=True)

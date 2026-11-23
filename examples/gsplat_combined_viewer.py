@@ -18,6 +18,7 @@ from importlib import abc
 import time
 
 import viser
+import torch
 from pathlib import Path
 from typing import Literal
 from typing import Tuple, Callable
@@ -26,6 +27,12 @@ from nerfview import Viewer, RenderTabState
 from gsplat.exporter import load_ply_to_splats
 from gsplat.rendering import RasterizeMode
 from gsplat.cuda._wrapper import CameraModel
+from gsplat.scene import GaussianScene
+
+import torch.nn.functional as F
+import math
+
+import gsplat.geometry.functional.quaternion as quat
 
 import tempfile
 
@@ -35,17 +42,78 @@ class GsplatCombinedObject:
     object in the GUI.
     """
 
-    def __init__(self, name: str, ply_file: str):
+    def __init__(self, name: str, ply_file: str, parent):
+        self.parent=parent
+        self.scene=parent.scene
         self.name = name
         self.ply_file = ply_file
         self.splats = load_ply_to_splats(ply_file)
         self.enabled = True
         self.movable = True
-        self.orientation = None
+        self.position = torch.tensor([0.0, 0.0, 0.0], device=self.scene.splats["means"].device, dtype=torch.float64)
+        self.origin = torch.tensor([0.0, 0.0, 0.0], device=self.scene.splats["means"].device, dtype=torch.float64)
+        self.xyzw = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
+        self.xyzw_origin = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
         self.path = None
-        self.gaussians = None
         self.folder_handle = None
 
+        self._add_to_scene()
+
+    def _add_to_scene(self):
+        """
+        Add the object to the scene.
+        """
+
+        splats_dict = self.splats
+        device = self.scene.splats["means"].device
+        means = splats_dict["means"].to(device)
+        quats = F.normalize(splats_dict["quats"].to(device), p=2, dim=-1)
+        scales_raw = splats_dict["scales"].to(device)
+        opacities_raw = splats_dict["opacities"].to(device)
+        sh0_t = splats_dict["sh0"].to(device)
+        shN_t = splats_dict["shN"].to(device)
+        colors = torch.cat([sh0_t, shN_t], dim=-2)
+        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
+
+        splats = torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(means, requires_grad=False),
+                "quats": torch.nn.Parameter(quats, requires_grad=False),
+                "scales": torch.nn.Parameter(scales_raw, requires_grad=False),
+                "opacities": torch.nn.Parameter(opacities_raw, requires_grad=False),
+                "colors": torch.nn.Parameter(colors, requires_grad=False),
+            }
+        )
+        self.scene.put(self.name, splats)
+
+        self.parent.rerender(None)
+
+    def move_to(self, position: list[float], wxyz: list[float]):
+        """
+        Move the object in the scene.
+        """
+        position_t = torch.tensor(position, device=self.scene.splats["means"].device, dtype=torch.float64)
+        xyzw_t = torch.tensor([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], device=self.scene.splats["means"].device, dtype=torch.float64)  # convert xyzw to wxyz
+        old_position = self.position
+        old_xyzw = self.xyzw
+        self.position = position_t - self.origin
+        self.xyzw = quat.quat_multiply(xyzw_t.unsqueeze(0), quat.quat_inverse(self.xyzw_origin.unsqueeze(0))).squeeze(0)
+        
+        # Calculate the transformation needed
+        todo_xyzw = quat.quat_multiply(self.xyzw.unsqueeze(0), quat.quat_inverse(old_xyzw.unsqueeze(0)))
+        todo_position = self.position - old_position
+
+        #adjust for origin and position
+        origin_adjust = quat.quat_rotate_vector(todo_xyzw, self.origin.unsqueeze(0))
+        todo_position_origin_adjust = todo_position - origin_adjust.squeeze(0) + self.origin.unsqueeze(0)
+        
+        offset_adjust = quat.quat_rotate_vector(todo_xyzw, self.position.unsqueeze(0))
+        todo_position_offset_adjust = todo_position_origin_adjust - offset_adjust.squeeze(0) + self.position.unsqueeze(0)
+        
+        self.scene.transform(self.name, trans=todo_position_offset_adjust, quart=todo_xyzw.squeeze(0))
+
+        self.parent.rerender(None)
+        
 
     def populate_gui(self, server: viser.ViserServer, folder_handle: viser.GuiFolderHandle):
         """
@@ -69,23 +137,47 @@ class GsplatCombinedObject:
 
             move_button = server.gui.add_checkbox(
                 f"Move",
-                initial_value=self.movable,
+                initial_value=True,
                 hint=f"Enable or disable the object {self.name}.",
             )
             @move_button.on_update
             def _(_) -> None:
-                self.movable = move_button.value
-                print(f"Object {self.name} movable: {self.movable}")
+                if move_button.value:
+                    set_origin_button.value = False
+                mover.visible = move_button.value or set_origin_button.value
 
-            set_origin_button = server.gui.add_button(
-                "Set Origin",
-                icon=viser.Icon.ACCESS_POINT,
-                hint=f"Set the origin of the object {self.name}.",
+
+            set_origin_button = server.gui.add_checkbox(
+                "Move Origin",
+                initial_value=False,
+                hint=f"Move the origin of the object {self.name}.",
             )
-            @set_origin_button.on_click
+            @set_origin_button.on_update
             def _(_) -> None:
-                # Set the origin of the object in the scene.
-                print(f"Set the origin of the object {self.name}.")
+                if set_origin_button.value:
+                    move_button.value = False
+                mover.visible = move_button.value or set_origin_button.value
+
+            mover = server.scene.add_transform_controls(
+                name=f"{self.name}/mover",
+                position=self.position,
+                visible=move_button.value,
+            )
+            @mover.on_update
+            def _(_) -> None:
+                if move_button.value:
+                    self.move_to(mover.position, mover.wxyz)
+                else:
+                    self.origin = torch.tensor(mover.position, device=self.scene.splats["means"].device,dtype=torch.float64) - self.position
+                    mover_xyzw = torch.tensor([mover.wxyz[1], mover.wxyz[2], mover.wxyz[3], mover.wxyz[0]], device=self.scene.splats["means"].device,dtype=torch.float64)  # convert xyzw to wxyz
+                    mover_xyzw = mover_xyzw.reshape(1, 4)
+                    self.xyzw_origin = quat.quat_multiply(mover_xyzw, quat.quat_inverse(self.xyzw.unsqueeze(0))).squeeze(0) # convert xyzw to wxyz
+                
+
+
+
+
+            #scale
 
             add_keyframe_button = server.gui.add_button(
                 "Add Keyframe",
@@ -96,6 +188,7 @@ class GsplatCombinedObject:
             def _(_) -> None:
                 # Add a keyframe for the object in the scene.
                 print(f"Add a keyframe for the object {self.name}.")
+
 
             clear_keyframes_button = server.gui.add_button(
                 "Clear Keyframes",
@@ -135,17 +228,19 @@ class GsplatCombinedObject:
             )
             @remove_button.on_click
             def _(_) -> None:
-                self.__del__()
+                if self.ply_file is not None:
+                    if self.ply_file.startswith(tempfile.gettempdir()):
+                        try:
+                            Path(self.ply_file).unlink()
+                        except Exception as e:
+                            print(f"Failed to delete temporary file {self.ply_file}: {e}")
+                if self.folder_handle is not None:
+                    self.folder_handle.remove()
+                if self.scene.get(self.name) is not None:
+                    self.scene.remove_component(self.name)
+                server.scene.remove_by_name(self.name)
+                self.parent.rerender(None)
 
-    def __del__(self):
-        if self.ply_file is not None:
-            if self.ply_file.startswith(tempfile.gettempdir()):
-                try:
-                    Path(self.ply_file).unlink()
-                except Exception as e:
-                    print(f"Failed to delete temporary file {self.ply_file}: {e}")
-        if self.folder_handle is not None:
-            self.folder_handle.remove()
 
 
 
@@ -160,11 +255,9 @@ class GsplatCombinedRenderTabState(RenderTabState):
     max_sh_degree: int = 5
    
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    
+
     rasterize_mode: RasterizeMode = "classic"
     camera_model: CameraModel = "pinhole"
-    objects: Tuple[GsplatCombinedObject, ...] = tuple()
-
 
 class GsplatCombinedViewer(Viewer):
     """
@@ -176,12 +269,14 @@ class GsplatCombinedViewer(Viewer):
         server: viser.ViserServer,
         render_fn: Callable,
         output_dir: Path,
+        scene: GaussianScene,
         mode: Literal["rendering", "training"] = "rendering",
         render_modes: tuple = ("rgb", "depth(accumulated)", "depth(expected)", "alpha"),
     ):
         if len(render_modes) == 0:
             raise ValueError("render_modes must contain at least one mode")
         self._render_modes = render_modes
+        self.scene = scene
         super().__init__(server, render_fn, output_dir, mode)
         server.gui.set_panel_label("gsplat viewer")
 
@@ -300,6 +395,18 @@ class GsplatCombinedViewer(Viewer):
                 def _(_) -> None:
                     add_object_button.disabled = True
                     object_file_button.disabled = True
+                    #check for valid name
+                    if not object_name_field.value:
+                        print("Object name cannot be empty.")
+                        add_object_button.disabled = False
+                        object_file_button.disabled = False
+                        return
+                    for key in self._objects_folder._children.keys():
+                        if self._objects_folder._children[key].label == object_name_field.value:
+                            print(f"Object name {object_name_field.value} already exists.")
+                            add_object_button.disabled = False
+                            object_file_button.disabled = False
+                            return
                     with self._objects_folder:
                         # Add a new object to the scene
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".ply") as f:
@@ -307,8 +414,7 @@ class GsplatCombinedViewer(Viewer):
                             f.flush()
                             temp_file_path = f.name
                         new_object_name = object_name_field.value
-                        new_object_state = GsplatCombinedObject(new_object_name, temp_file_path)
-                        self.render_tab_state.objects += (new_object_state,)
+                        new_object_state = GsplatCombinedObject(new_object_name, temp_file_path, self)
                         obj_folder = server.gui.add_folder(new_object_name)
                         new_object_state.populate_gui(server, obj_folder)
                     add_object_button.disabled = False
