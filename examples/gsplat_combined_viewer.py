@@ -14,9 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from importlib import abc
-import time
-
 import viser
 import torch
 from pathlib import Path
@@ -36,81 +33,32 @@ import gsplat.geometry.functional.quaternion as quat
 
 import tempfile
 
+from gsplat_combined_object import GsplatCombinedObject
 
-class GsplatCombinedObject:
+
+
+class GsplatCombinedObject_viser(GsplatCombinedObject):
     """
     object in the GUI.
     """
 
     def __init__(self, name: str, ply_file: str, parent):
         self.parent=parent
-        self.scene=parent.scene
-        self.name = name
-        self.ply_file = ply_file
-        self.splats = load_ply_to_splats(ply_file)
         self.enabled = True
         self.movable = True
-        self.position = torch.tensor([0.0, 0.0, 0.0], device=self.scene.splats["means"].device, dtype=torch.float64)
-        self.origin = torch.tensor([0.0, 0.0, 0.0], device=self.scene.splats["means"].device, dtype=torch.float64)
-        self.xyzw = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
-        self.xyzw_origin = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.scene.splats["means"].device, dtype=torch.float64)
         self.path = None
         self.folder_handle = None
 
-        self._add_to_scene()
-
-    def _add_to_scene(self):
-        """
-        Add the object to the scene.
-        """
-
-        splats_dict = self.splats
-        device = self.scene.splats["means"].device
-        means = splats_dict["means"].to(device)
-        quats = F.normalize(splats_dict["quats"].to(device), p=2, dim=-1)
-        scales_raw = splats_dict["scales"].to(device)
-        opacities_raw = splats_dict["opacities"].to(device)
-        sh0_t = splats_dict["sh0"].to(device)
-        shN_t = splats_dict["shN"].to(device)
-        colors = torch.cat([sh0_t, shN_t], dim=-2)
-        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
-
-        splats = torch.nn.ParameterDict(
-            {
-                "means": torch.nn.Parameter(means, requires_grad=False),
-                "quats": torch.nn.Parameter(quats, requires_grad=False),
-                "scales": torch.nn.Parameter(scales_raw, requires_grad=False),
-                "opacities": torch.nn.Parameter(opacities_raw, requires_grad=False),
-                "colors": torch.nn.Parameter(colors, requires_grad=False),
-            }
-        )
-        self.scene.put(self.name, splats)
+        super().__init__(name, ply_file, parent.scene)
 
         self.parent.rerender(None)
 
+
     def move_to(self, position: list[float], wxyz: list[float]):
         """
-        Move the object in the scene.
+        Move the object in the scene. Then rerender the scene.
         """
-        position_t = torch.tensor(position, device=self.scene.splats["means"].device, dtype=torch.float64)
-        xyzw_t = torch.tensor([wxyz[1], wxyz[2], wxyz[3], wxyz[0]], device=self.scene.splats["means"].device, dtype=torch.float64)  # convert xyzw to wxyz
-        old_position = self.position
-        old_xyzw = self.xyzw
-        self.position = position_t - self.origin
-        self.xyzw = quat.quat_multiply(xyzw_t.unsqueeze(0), quat.quat_inverse(self.xyzw_origin.unsqueeze(0))).squeeze(0)
-        
-        # Calculate the transformation needed
-        todo_xyzw = quat.quat_multiply(self.xyzw.unsqueeze(0), quat.quat_inverse(old_xyzw.unsqueeze(0)))
-        todo_position = self.position - old_position
-
-        #adjust for origin and position
-        origin_adjust = quat.quat_rotate_vector(todo_xyzw, self.origin.unsqueeze(0))
-        todo_position_origin_adjust = todo_position - origin_adjust.squeeze(0) + self.origin.unsqueeze(0)
-        
-        offset_adjust = quat.quat_rotate_vector(todo_xyzw, self.position.unsqueeze(0))
-        todo_position_offset_adjust = todo_position_origin_adjust - offset_adjust.squeeze(0) + self.position.unsqueeze(0)
-        
-        self.scene.transform(self.name, trans=todo_position_offset_adjust, quart=todo_xyzw.squeeze(0))
+        super().move_to(position, wxyz)
 
         self.parent.rerender(None)
         
@@ -414,7 +362,7 @@ class GsplatCombinedViewer(Viewer):
                             f.flush()
                             temp_file_path = f.name
                         new_object_name = object_name_field.value
-                        new_object_state = GsplatCombinedObject(new_object_name, temp_file_path, self)
+                        new_object_state = GsplatCombinedObject_viser(new_object_name, temp_file_path, self)
                         obj_folder = server.gui.add_folder(new_object_name)
                         new_object_state.populate_gui(server, obj_folder)
                     add_object_button.disabled = False
